@@ -7,7 +7,7 @@ use std::{
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 
 // opcodes
-// note: incomplete; only contains opcodes that we currently use
+// note: incomplete; only contains opcodes that we use or explored
 #[derive(Debug)]
 pub enum OpCode {
     ProtocolVersion = 0x00,
@@ -18,6 +18,7 @@ pub enum OpCode {
     Select = 0x06,
     MtuGet = 0x07,
     Write = 0x08,
+    #[allow(dead_code, reason = "currently unused but useful during exploration")]
     Ping = 0x09,
     HardwareVersionGet = 0x0A,
     FirmwareVersionGet = 0x0B,
@@ -200,6 +201,7 @@ impl Response for HardwareVersionResponse {
     }
 }
 
+#[allow(unused, reason = "currently unused but useful during exploration")]
 pub struct PingRequest(pub u8);
 
 impl Request for PingRequest {
