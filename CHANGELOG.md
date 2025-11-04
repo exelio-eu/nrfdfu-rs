@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Declare required Rust version (currently 1.82.0)
+- Update dependencies, removing `atty`
+
 ## 0.2.0
 
 - Added `--help` argument
