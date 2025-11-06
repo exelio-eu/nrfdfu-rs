@@ -1,17 +1,15 @@
 use clap::Parser;
-use serialport::{available_ports, SerialPort};
-use std::convert::TryInto;
-use std::hash::Hasher;
-use std::path::Path;
-use std::time::Duration;
+use serialport::available_ports;
 use std::{error::Error, fs};
 
 #[macro_use]
 mod macros;
+mod connection;
 mod messages;
 mod radio_manifest;
 mod slip;
 
+use crate::connection::BootloaderConnection;
 use crate::radio_manifest::RadioManifestJSONObject;
 use messages::*;
 
@@ -42,7 +40,7 @@ struct Args {
     verbose: u8,
 
     /// Directory with files to flash
-    path: std::path::PathBuf,
+    path: Option<std::path::PathBuf>,
 
     #[arg(
         short,
@@ -92,9 +90,15 @@ fn run() -> Result<()> {
 
     set_logger(args.verbose);
 
-    let manifest_path = args.path.join("manifest.json");
-    let manifest_contents = fs::read_to_string(&manifest_path)?;
-    let image = serde_json::from_str::<RadioManifestJSONObject>(&manifest_contents)?;
+    let image = if let Some(path) = args.path.as_ref() {
+        let manifest_path = path.join("manifest.json");
+        let manifest_contents = fs::read_to_string(&manifest_path)?;
+        Some(serde_json::from_str::<RadioManifestJSONObject>(
+            &manifest_contents,
+        )?)
+    } else {
+        None
+    };
 
     let matching_ports: Vec<_> = available_ports()?
         .into_iter()
@@ -137,7 +141,7 @@ fn run() -> Result<()> {
     for port in matching_ports {
         let result = run_on_port(
             &port,
-            &args.path,
+            args.path.as_ref(),
             image.clone(),
             args.get_images,
             args.abort,
@@ -162,8 +166,8 @@ fn run() -> Result<()> {
 
 fn run_on_port(
     port: &serialport::SerialPortInfo,
-    path: &Path,
-    image: RadioManifestJSONObject,
+    path: Option<&std::path::PathBuf>,
+    image: Option<RadioManifestJSONObject>,
     get_images: bool,
     abort: bool,
 ) -> Result<()> {
@@ -181,298 +185,59 @@ fn run_on_port(
             .unwrap_or("unknown".into())
     );
 
-    // On Windows, this is required, otherwise communication fails with timeouts
-    // (or just hangs forever).
+    let mut conn = BootloaderConnection::wait_connection(port);
+    // Disable receipt notification. USB is a reliable transport.
+    conn.set_receipt_notification(0)?;
 
-    for image_item in image.manifest.into_iter().flatten() {
-        let mut conn = loop {
-            let port = loop {
-                if let Ok(port) = serialport::new(&port.port_name, 115200)
-                    .timeout(Duration::from_millis(5000))
-                    .open()
-                {
-                    break port;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            };
-            if let Ok(c) = BootloaderConnection::new(port) {
-                break c;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        log::debug!("Waiting device");
-        // Disable receipt notification. USB is a reliable transport.
-        conn.set_receipt_notification(0)?;
+    let obj_select = conn.select_object_command();
+    log::debug!("select object response: {:?}", obj_select);
 
-        let obj_select = conn.select_object_command();
-        log::debug!("select object response: {:?}", obj_select);
+    let version = conn.fetch_protocol_version()?;
+    log::debug!("protocol version: {}", version);
 
-        let version = conn.fetch_protocol_version()?;
-        log::debug!("protocol version: {}", version);
+    let hw_version = conn.fetch_hardware_version()?;
+    log::debug!("hardware version: {:?}", hw_version);
 
-        let hw_version = conn.fetch_hardware_version()?;
-        log::debug!("hardware version: {:?}", hw_version);
+    if get_images {
+        let bootloader_version = conn.fetch_firmware_version(0)?;
+        println!("* image 0: {}", bootloader_version);
 
-        if get_images {
-            let bootloader_version = conn.fetch_firmware_version(0)?;
-            println!("* image 0: {}", bootloader_version);
+        let primary_version = conn.fetch_firmware_version(1)?;
+        println!("* image 1: {}", primary_version);
 
-            let primary_version = conn.fetch_firmware_version(1)?;
-            println!("* image 1: {}", primary_version);
-
-            if primary_version.type_ == Some(FirmwareType::Softdevice) {
-                let secondary_version = conn.fetch_firmware_version(2)?;
-                println!("* image 2: {:#?}", secondary_version);
-            }
+        if primary_version.type_ == Some(FirmwareType::Softdevice) {
+            let secondary_version = conn.fetch_firmware_version(2)?;
+            println!("* image 2: {:#?}", secondary_version);
         }
+    }
+    drop(conn);
 
-        let init_packet_path = path.join(image_item.dat_file);
-        let init_packet_data = fs::read(&init_packet_path)?;
-        let firmware_path = path.join(image_item.bin_file);
-        let firmware_data = fs::read(&firmware_path)?;
-        conn.send_init_packet(&init_packet_data)?;
-        conn.send_firmware(&firmware_data)?;
+    if let Some(path) = path {
+        if let Some(image) = image {
+            for image_item in image.manifest.into_iter().flatten() {
+                let mut conn = BootloaderConnection::wait_connection(port);
+                // Disable receipt notification. USB is a reliable transport.
+                conn.set_receipt_notification(0)?;
 
-        if abort {
-            let abort_result = conn.abort();
+                let init_packet_path = path.join(image_item.dat_file);
+                let init_packet_data = fs::read(&init_packet_path)?;
+                let firmware_path = path.join(image_item.bin_file);
+                let firmware_data = fs::read(&firmware_path)?;
+                conn.send_init_packet(&init_packet_data)?;
+                conn.send_firmware(&firmware_data)?;
 
-            if abort_result.is_ok() {
-                log::warn!("Response received to Abort command (expected USB disconnect)");
+                if abort {
+                    let abort_result = conn.abort();
+
+                    if abort_result.is_ok() {
+                        log::warn!("Response received to Abort command (expected USB disconnect)");
+                    }
+                }
             }
         }
     }
 
     Ok(())
-}
-
-struct BootloaderConnection {
-    serial: Box<dyn SerialPort>,
-    buf: Vec<u8>,
-    mtu: u16,
-}
-
-impl BootloaderConnection {
-    fn new(serial: Box<dyn SerialPort>) -> Result<Self> {
-        let mut this = Self {
-            serial,
-            buf: Vec::new(),
-            mtu: 0,
-        };
-
-        // We must check the protocol version before doing anything else, since any other command
-        // might change if the version changes.
-        let proto_version = this.fetch_protocol_version()?;
-        if proto_version != PROTOCOL_VERSION {
-            return Err(format!(
-                "device reports protocol version {}, we only support {}",
-                proto_version, PROTOCOL_VERSION
-            )
-            .into());
-        }
-
-        let mtu = this.fetch_mtu()?;
-        log::debug!("MTU = {} Bytes", mtu);
-        this.mtu = mtu;
-        Ok(this)
-    }
-
-    /// send `req` and do not fetch any response
-    fn request<R: Request>(&mut self, req: R) -> Result<()> {
-        let mut buf = vec![R::OPCODE as u8];
-        req.write_payload(&mut buf)?;
-        log::trace!("--> {:?}", buf);
-
-        // Go through an intermediate buffer to avoid writing every byte individually.
-        self.buf.clear();
-        slip::encode_frame(&buf, &mut self.buf)?;
-        self.serial
-            .write_all(&self.buf)
-            .map_err(|e| format!("error while writing to serial port: {}", e))?;
-        self.serial.flush()?;
-
-        Ok(())
-    }
-
-    /// send `req` and expect a response.
-    /// aborts if no response is received within timeout window.
-    fn request_response<R: Request>(&mut self, req: R) -> Result<R::Response> {
-        self.request(req)?;
-
-        self.buf.clear();
-        slip::decode_frame(&mut self.serial, &mut self.buf)
-            .map_err(|e| format!("error while reading from serial port: {}", e))?;
-        log::trace!("<-- {:?}", self.buf);
-
-        messages::parse_response::<R>(&self.buf)
-    }
-
-    fn fetch_protocol_version(&mut self) -> Result<u8> {
-        let response = self.request_response(ProtocolVersionRequest);
-        match response {
-            Ok(version_response) => Ok(version_response.version),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn fetch_hardware_version(&mut self) -> Result<HardwareVersionResponse> {
-        self.request_response(HardwareVersionRequest)
-    }
-
-    fn fetch_firmware_version(&mut self, image: u8) -> Result<FirmwareVersionResponse> {
-        self.request_response(FirmwareVersionRequest(image))
-    }
-
-    /// Sends the `.dat` file that's zipped into our firmware DFU .zip(?)
-    /// modeled after `pc-nrfutil`s `dfu_transport_serial::send_init_packet()`
-    fn send_init_packet(&mut self, data: &[u8]) -> Result<()> {
-        log::info!("Sending init packet...");
-        let select_response = self.select_object_command()?;
-        log::debug!("Object selected: {:?}", select_response);
-
-        let data_size = data.len() as u32;
-
-        log::debug!("Creating Command...");
-        self.create_command_object(data_size)?;
-        log::debug!("Command created");
-
-        log::debug!("Streaming Data: len: {}", data_size);
-        self.stream_object_data(data)?;
-
-        let received_crc = self.get_crc()?.crc;
-        self.check_crc(data, received_crc, 0)?;
-
-        self.execute()?;
-
-        Ok(())
-    }
-
-    /// Sends the firmware image at `bin_path`.
-    /// This is done in chunks to avoid exceeding our MTU  and involves periodic CRC checks.
-    fn send_firmware(&mut self, image: &[u8]) -> Result<()> {
-        log::info!("Sending firmware image of size {}...", image.len());
-
-        log::debug!("Selecting Object: type Data");
-        let select_response = self.select_object_data()?;
-        log::debug!("Object selected: {:?}", select_response);
-
-        let max_size = select_response.max_size;
-        let mut prev_chunk_crc: u32 = 0;
-
-        for chunk in image.chunks(max_size.try_into().unwrap()) {
-            let curr_chunk_sz: u32 = chunk.len().try_into().unwrap();
-            self.create_data_object(curr_chunk_sz)?;
-            log::debug!("Streaming Data: len: {}", curr_chunk_sz);
-
-            self.stream_object_data(chunk)?;
-
-            let received_crc = self.get_crc()?;
-            log::debug!("crc response: {:?}", received_crc);
-            prev_chunk_crc = self.check_crc(chunk, received_crc.crc, prev_chunk_crc)?;
-
-            self.execute()?;
-        }
-
-        log::info!("Done.");
-        Ok(())
-    }
-
-    fn check_crc(&self, data: &[u8], received_crc: u32, initial: u32) -> Result<u32> {
-        let mut digest = crc32fast::Hasher::new_with_initial(initial);
-        digest.write(data);
-        let expected_crc = digest.finalize();
-
-        if expected_crc == received_crc {
-            log::debug!("crc passed.");
-            Ok(expected_crc)
-        } else {
-            let err_msg = format!(
-                "crc failed: expected {} - received {}",
-                expected_crc, received_crc
-            );
-            log::debug!("{}", err_msg);
-            Err(err_msg.into())
-        }
-    }
-
-    /// Sends a
-    /// Request Type: `Select`
-    /// Parameters:   `Object type = Command`
-    fn select_object_command(&mut self) -> Result<SelectResponse> {
-        self.request_response(SelectRequest(ObjectType::Command))
-    }
-
-    /// Sends a
-    /// Request Type: `Select`
-    /// Parameters:   `Object type = Data`
-    fn select_object_data(&mut self) -> Result<SelectResponse> {
-        self.request_response(SelectRequest(ObjectType::Data))
-    }
-
-    /// Sends a
-    /// Request Type: `Create`
-    /// Parameters:   `Object type = Command`
-    ///               `size`
-    fn create_command_object(&mut self, size: u32) -> Result<()> {
-        self.request_response(CreateObjectRequest {
-            obj_type: ObjectType::Command,
-            size,
-        })?;
-        Ok(())
-    }
-
-    /// Sends a
-    /// Request Type: `Create`
-    /// Parameters:   `Object type = Data`
-    ///               `size`
-    fn create_data_object(&mut self, size: u32) -> Result<()> {
-        // Note: Data objects cannot be created if no init packet has been sent. This results in an
-        // `OperationNotPermitted` error.
-        self.request_response(CreateObjectRequest {
-            obj_type: ObjectType::Data,
-            size,
-        })?;
-        Ok(())
-    }
-
-    fn set_receipt_notification(&mut self, every_n_packets: u16) -> Result<()> {
-        self.request_response(SetPrnRequest(every_n_packets))?;
-        Ok(())
-    }
-
-    fn fetch_mtu(&mut self) -> Result<u16> {
-        Ok(self.request_response(GetMtuRequest)?.0)
-    }
-
-    fn stream_object_data(&mut self, data: &[u8]) -> Result<()> {
-        // On the wire, the write request contains the opcode byte, and is then SLIP-encoded,
-        // potentially doubling the size, and adding a frame terminator, so the chunk size has
-        // to be smaller than the MTU.
-        let max_chunk_size = usize::from((self.mtu - 1) / 2 - 1);
-
-        for chunk in data.chunks(max_chunk_size) {
-            // TODO: this also needs to take into account the receipt response. In our case we turn
-            // it off, so there's nothing to do here.
-            self.request(WriteRequest {
-                request_payload: chunk,
-            })?;
-        }
-
-        Ok(())
-    }
-
-    fn get_crc(&mut self) -> Result<CrcResponse> {
-        self.request_response(CrcRequest)
-    }
-
-    // tell the target to execute whatever request setup we sent them before
-    fn execute(&mut self) -> Result<ExecuteResponse> {
-        self.request_response(ExecuteRequest)
-    }
-
-    /// Sends the Abort command, causing a reboot without reflashing.
-    fn abort(&mut self) -> Result<AbortResponse> {
-        self.request_response(AbortRequest)
-    }
 }
 
 /// Initializes the logger using the provided log level.
