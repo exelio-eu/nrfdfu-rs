@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use clap::Parser;
-use log::LevelFilter;
 use serialport::{available_ports, SerialPort};
 use std::convert::TryInto;
 use std::hash::Hasher;
@@ -42,25 +41,15 @@ fn main() {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Prints the bootloader and application version, along with their memory areas.
-    #[arg(long)]
-    get_images: bool,
-
-    /// Selects the USB device with the given serial number
-    #[arg(long)]
-    serial: Option<String>,
+    #[arg(short, long, global = true, action = clap::ArgAction::Count, default_value = "0", help = "Set log level"
+    )]
+    verbose: u8,
 
     /// Directory with files to flash
-    dir_path: Option<std::path::PathBuf>,
+    path: std::path::PathBuf,
 
-    /// Reboots into the application even if no other application was performed.
-    #[arg(long)]
-    abort: bool,
-
-    /// Runs the command on *all* recognized devices after printing the port's details.
-    ///
-    /// Errors are accumulated and reported after all ports have been tried.
-    #[arg(long)]
+    #[arg(short, long, global = true, default_value = "false", help = "Update all devices"
+    )]
     all: bool,
 }
 
@@ -80,23 +69,13 @@ impl std::error::Error for PreviousErrors {}
 
 fn run() -> Result<()> {
     // We show info and higher levels by default, but allow overriding this via `RUST_LOG`.
-    env_logger::builder()
-        .filter_level(LevelFilter::Debug)
-        .parse_default_env()
-        .init();
-
     let args = Args::parse();
 
-    let image = if let Some(dir_path) = &args.dir_path {
-        let manifest_path = dir_path.join("manifest.json");
-        let manifest_contents = fs::read_to_string(&manifest_path)?;
+    set_logger(args.verbose);
 
-        let image = serde_json::from_str::<RadioManifestJSONObject>(&manifest_contents)?;
-
-        Some(image)
-    } else {
-        None
-    };
+    let manifest_path = args.path.join("manifest.json");
+    let manifest_contents = fs::read_to_string(&manifest_path)?;
+    let image = serde_json::from_str::<RadioManifestJSONObject>(&manifest_contents)?;
 
     let matching_ports: Vec<_> = available_ports()?
         .into_iter()
@@ -113,10 +92,6 @@ fn run() -> Result<()> {
 
                 usb.vid == USB_VID
                     && usb.pid == USB_PID
-                    && args
-                    .serial
-                    .as_ref()
-                    .is_none_or(|s| Some(s) == usb.serial_number.as_ref())
             }
             _ => false,
         })
@@ -132,36 +107,30 @@ fn run() -> Result<()> {
         }
         1 => (),
         _ => {
-            if !args.all {
-                return Err("multiple matching USB serial devices found".into());
+            if ! args.all{
+                eprintln!("Too many nRF devices found in DFU");
+                std::process::exit(1);
             }
         }
     };
-
-    let mut errors_in_all = false;
+    
+    let mut error_in_all = false;
 
     for port in matching_ports {
-        let result = run_on_port(&port, &args, args.dir_path.as_ref(), image.clone());
+        let result = run_on_port(&port, &args.path, image.clone());
         if let Err(e) = result {
-            if args.all {
-                // The current port is printed in run_on_port anyway, but it doesn't hurt to be
-                // explicit, especially since stdout and stderr might not be sorted properly.
-                eprintln!("error processing {}: {e}", &port.port_name);
-                errors_in_all = true;
-            } else {
+            eprintln!("error processing {}: {e}", &port.port_name);
+            if ! args.all {
                 return Err(e);
+            } else {
+                error_in_all = true;
             }
         }
     }
-
-    if errors_in_all {
-        return Err(PreviousErrors.into());
-    }
-
-    if image.is_none() && !args.get_images && !args.abort {
-        // This is done at the end so that errors from working on an --all still show up, to
-        // increase the usefulness of RUST_LOG=debug or as a kind of readiness check.
-        return Err("No actions performed; provide an .elf file on the command line to flash, or set querying options.".into());
+    
+    if error_in_all{
+        eprintln!("At least one update failed");
+        std::process::exit(1);
     }
 
     Ok(())
@@ -169,81 +138,61 @@ fn run() -> Result<()> {
 
 fn run_on_port(
     port: &serialport::SerialPortInfo,
-    args: &Args,
-    dir_path: Option<&PathBuf>,
-    mut image: Option<RadioManifestJSONObject>,
+    path: &PathBuf,
+    image: RadioManifestJSONObject,
 ) -> Result<()> {
     log::debug!("opening {} (type {:?})", port.port_name, port.port_type);
-    if args.all {
-        let serial = match &port.port_type {
-            serialport::SerialPortType::UsbPort(s) => s.serial_number.as_ref(),
-            // Those don't get through filtering anyway
-            _ => None,
-        };
-        println!(
-            "Found port {} (serial: {})",
-            port.port_name,
-            serial
-                .map(|s| format!("{:?}", s))
-                .unwrap_or("unknown".into())
-        );
-    }
+    let serial = match &port.port_type {
+        serialport::SerialPortType::UsbPort(s) => s.serial_number.as_ref(),
+        // Those don't get through filtering anyway
+        _ => None,
+    };
+    println!(
+        "Found port {} (serial: {})",
+        port.port_name,
+        serial
+            .map(|s| format!("{:?}", s))
+            .unwrap_or("unknown".into())
+    );
 
     // On Windows, this is required, otherwise communication fails with timeouts
     // (or just hangs forever).
 
-    if let Some(image) = image.take() {
-        if let Some(path) = dir_path {
-            for image_item in image.manifest.into_iter().flatten() {
-                let mut conn = loop {
-                    let port = loop {
-                        if let Ok(port) = serialport::new(&port.port_name, 115200)
-                            .timeout(Duration::from_millis(5000))
-                            .open()
-                        {
-                            break port;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    };
-                    if let Ok(c) = BootloaderConnection::new(port) {
-                        break c;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                };
-                log::debug!("Waiting device");
-                // Disable receipt notification. USB is a reliable transport.
-                conn.set_receipt_notification(0)?;
-
-                let obj_select = conn.select_object_command();
-                log::debug!("select object response: {:?}", obj_select);
-
-                let version = conn.fetch_protocol_version()?;
-                log::debug!("protocol version: {}", version);
-
-                let hw_version = conn.fetch_hardware_version()?;
-                log::debug!("hardware version: {:?}", hw_version);
-
-                if args.get_images {
-                    let bootloader_version = conn.fetch_firmware_version(0)?;
-                    println!("* image 0: {}", bootloader_version);
-
-                    let primary_version = conn.fetch_firmware_version(1)?;
-                    println!("* image 1: {}", primary_version);
-
-                    if primary_version.type_ == Some(FirmwareType::Softdevice) {
-                        let secondary_version = conn.fetch_firmware_version(2)?;
-                        println!("* image 2: {:#?}", secondary_version);
-                    }
+    for image_item in image.manifest.into_iter().flatten() {
+        let mut conn = loop {
+            let port = loop {
+                if let Ok(port) = serialport::new(&port.port_name, 115200)
+                    .timeout(Duration::from_millis(5000))
+                    .open()
+                {
+                    break port;
                 }
-
-                let init_packet_path = path.join(image_item.dat_file);
-                let init_packet_data = fs::read(&init_packet_path)?;
-                let firmware_path = path.join(image_item.bin_file);
-                let firmware_data = fs::read(&firmware_path)?;
-                conn.send_init_packet(&init_packet_data)?;
-                conn.send_firmware(&firmware_data)?;
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            if let Ok(c) = BootloaderConnection::new(port) {
+                break c;
             }
-        }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        log::debug!("Waiting device");
+        // Disable receipt notification. USB is a reliable transport.
+        conn.set_receipt_notification(0)?;
+
+        let obj_select = conn.select_object_command();
+        log::debug!("select object response: {:?}", obj_select);
+
+        let version = conn.fetch_protocol_version()?;
+        log::debug!("protocol version: {}", version);
+
+        let hw_version = conn.fetch_hardware_version()?;
+        log::debug!("hardware version: {:?}", hw_version);
+
+        let init_packet_path = path.join(image_item.dat_file);
+        let init_packet_data = fs::read(&init_packet_path)?;
+        let firmware_path = path.join(image_item.bin_file);
+        let firmware_data = fs::read(&firmware_path)?;
+        conn.send_init_packet(&init_packet_data)?;
+        conn.send_firmware(&firmware_data)?;
     }
 
     Ok(())
@@ -477,4 +426,21 @@ impl BootloaderConnection {
     fn abort(&mut self) -> Result<AbortResponse> {
         self.request_response(AbortRequest)
     }
+}
+
+/// Initializes the logger using the provided log level.
+fn set_logger(verbose: u8){
+    let log_level = match verbose {
+        0 => log::LevelFilter::Off,
+        1 => log::LevelFilter::Error,
+        2 => log::LevelFilter::Warn,
+        3 => log::LevelFilter::Info,
+        4 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    };
+
+    env_logger::builder()
+        .filter_level(log_level)
+        .parse_default_env()
+        .init();
 }
