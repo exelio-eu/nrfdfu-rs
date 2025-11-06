@@ -1,17 +1,13 @@
-#![allow(dead_code)]
-
 use clap::Parser;
 use serialport::{available_ports, SerialPort};
 use std::convert::TryInto;
 use std::hash::Hasher;
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Duration;
 use std::{error::Error, fs};
 
 #[macro_use]
 mod macros;
-mod elf;
-mod init_packet;
 mod messages;
 mod radio_manifest;
 mod slip;
@@ -48,9 +44,32 @@ struct Args {
     /// Directory with files to flash
     path: std::path::PathBuf,
 
-    #[arg(short, long, global = true, default_value = "false", help = "Update all devices"
+    #[arg(
+        short,
+        long,
+        global = true,
+        default_value = "false",
+        help = "Update all devices"
     )]
     all: bool,
+
+    #[arg(
+        short('x'),
+        long,
+        global = true,
+        default_value = "false",
+        help = "Send abort after updating a device"
+    )]
+    abort: bool,
+
+    #[arg(
+        short('i'),
+        long,
+        global = true,
+        default_value = "false",
+        help = "Get images before updating"
+    )]
+    get_images: bool,
 }
 
 /// Previous errors occurred and were printed.
@@ -90,8 +109,7 @@ fn run() -> Result<()> {
                     return false;
                 }
 
-                usb.vid == USB_VID
-                    && usb.pid == USB_PID
+                usb.vid == USB_VID && usb.pid == USB_PID
             }
             _ => false,
         })
@@ -107,28 +125,34 @@ fn run() -> Result<()> {
         }
         1 => (),
         _ => {
-            if ! args.all{
+            if !args.all {
                 eprintln!("Too many nRF devices found in DFU");
                 std::process::exit(1);
             }
         }
     };
-    
+
     let mut error_in_all = false;
 
     for port in matching_ports {
-        let result = run_on_port(&port, &args.path, image.clone());
+        let result = run_on_port(
+            &port,
+            &args.path,
+            image.clone(),
+            args.get_images,
+            args.abort,
+        );
         if let Err(e) = result {
             eprintln!("error processing {}: {e}", &port.port_name);
-            if ! args.all {
+            if !args.all {
                 return Err(e);
             } else {
                 error_in_all = true;
             }
         }
     }
-    
-    if error_in_all{
+
+    if error_in_all {
         eprintln!("At least one update failed");
         std::process::exit(1);
     }
@@ -138,8 +162,10 @@ fn run() -> Result<()> {
 
 fn run_on_port(
     port: &serialport::SerialPortInfo,
-    path: &PathBuf,
+    path: &Path,
     image: RadioManifestJSONObject,
+    get_images: bool,
+    abort: bool,
 ) -> Result<()> {
     log::debug!("opening {} (type {:?})", port.port_name, port.port_type);
     let serial = match &port.port_type {
@@ -187,12 +213,33 @@ fn run_on_port(
         let hw_version = conn.fetch_hardware_version()?;
         log::debug!("hardware version: {:?}", hw_version);
 
+        if get_images {
+            let bootloader_version = conn.fetch_firmware_version(0)?;
+            println!("* image 0: {}", bootloader_version);
+
+            let primary_version = conn.fetch_firmware_version(1)?;
+            println!("* image 1: {}", primary_version);
+
+            if primary_version.type_ == Some(FirmwareType::Softdevice) {
+                let secondary_version = conn.fetch_firmware_version(2)?;
+                println!("* image 2: {:#?}", secondary_version);
+            }
+        }
+
         let init_packet_path = path.join(image_item.dat_file);
         let init_packet_data = fs::read(&init_packet_path)?;
         let firmware_path = path.join(image_item.bin_file);
         let firmware_data = fs::read(&firmware_path)?;
         conn.send_init_packet(&init_packet_data)?;
         conn.send_firmware(&firmware_data)?;
+
+        if abort {
+            let abort_result = conn.abort();
+
+            if abort_result.is_ok() {
+                log::warn!("Response received to Abort command (expected USB disconnect)");
+            }
+        }
     }
 
     Ok(())
@@ -220,7 +267,7 @@ impl BootloaderConnection {
                 "device reports protocol version {}, we only support {}",
                 proto_version, PROTOCOL_VERSION
             )
-                .into());
+            .into());
         }
 
         let mtu = this.fetch_mtu()?;
@@ -429,7 +476,7 @@ impl BootloaderConnection {
 }
 
 /// Initializes the logger using the provided log level.
-fn set_logger(verbose: u8){
+fn set_logger(verbose: u8) {
     let log_level = match verbose {
         0 => log::LevelFilter::Off,
         1 => log::LevelFilter::Error,
