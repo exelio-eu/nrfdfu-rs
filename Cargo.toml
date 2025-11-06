@@ -1,29 +1,17 @@
 [package]
 name = "nrfdfu"
 version = "0.2.1"
-authors = [
-    "Jonathan Pallant <jonathan.pallant@ferrous-systems.com>",
-]
-edition = "2018"
-# Keep in sync with .github/workflows/check.yml
-rust-version = "1.82.0"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 description = "A flashing tool for the nRF bootloader"
-repository = "https://github.com/knurling-rs/nrfdfu-rs"
+edition = "2024"
 
 [dependencies]
-byteorder = "1.4.3"
-clap = { version = "4.5.37", features = ["derive", "std", "help"], default-features = false }
+byteorder = "1.5.0"
+clap = { version = "4.5.51", features = ["derive"] }
 crc32fast = "1.2.1"
 env_logger = "0.11"
-leb128 = "0.2.4"
 log = "0.4.14"
-object = { version = "0.36", default-features = false, features = ["elf", "read_core", "std"] }
 serialport = { version = "4.7", default-features = false }
-sha2 = "0.10"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-
-[dev-dependencies]
-expect-test = "1"

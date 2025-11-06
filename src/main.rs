@@ -125,7 +125,7 @@ fn run() -> Result<()> {
                 "no matching USB serial device found.\n       Remember to put the \
                                  device in bootloader mode by pressing the reset button!"
                     .into(),
-            )
+            );
         }
         1 => (),
         _ => {
@@ -212,26 +212,26 @@ fn run_on_port(
     }
     drop(conn);
 
-    if let Some(path) = path {
-        if let Some(image) = image {
-            for image_item in image.manifest.into_iter().flatten() {
-                let mut conn = BootloaderConnection::wait_connection(port);
-                // Disable receipt notification. USB is a reliable transport.
-                conn.set_receipt_notification(0)?;
+    if let Some(path) = path
+        && let Some(image) = image
+    {
+        for image_item in image.manifest.into_iter().flatten() {
+            let mut conn = BootloaderConnection::wait_connection(port);
+            // Disable receipt notification. USB is a reliable transport.
+            conn.set_receipt_notification(0)?;
 
-                let init_packet_path = path.join(image_item.dat_file);
-                let init_packet_data = fs::read(&init_packet_path)?;
-                let firmware_path = path.join(image_item.bin_file);
-                let firmware_data = fs::read(&firmware_path)?;
-                conn.send_init_packet(&init_packet_data)?;
-                conn.send_firmware(&firmware_data)?;
+            let init_packet_path = path.join(image_item.dat_file);
+            let init_packet_data = fs::read(&init_packet_path)?;
+            let firmware_path = path.join(image_item.bin_file);
+            let firmware_data = fs::read(&firmware_path)?;
+            conn.send_init_packet(&init_packet_data)?;
+            conn.send_firmware(&firmware_data)?;
 
-                if abort {
-                    let abort_result = conn.abort();
+            if abort {
+                let abort_result = conn.abort();
 
-                    if abort_result.is_ok() {
-                        log::warn!("Response received to Abort command (expected USB disconnect)");
-                    }
+                if abort_result.is_ok() {
+                    log::warn!("Response received to Abort command (expected USB disconnect)");
                 }
             }
         }

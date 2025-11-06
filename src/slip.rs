@@ -37,7 +37,7 @@ pub fn decode_frame(reader: impl Read, buf: &mut Vec<u8>) -> io::Result<()> {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("invalid byte following ESC: 0x{:02x}", invalid),
-                    ))
+                    ));
                 }
                 Some(Err(e)) => return Err(e),
             },

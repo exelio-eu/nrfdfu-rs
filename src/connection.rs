@@ -4,7 +4,7 @@ use crate::messages::{
     HardwareVersionRequest, HardwareVersionResponse, ObjectType, ProtocolVersionRequest, Request,
     SelectRequest, SelectResponse, SetPrnRequest, WriteRequest,
 };
-use crate::{messages, slip, PROTOCOL_VERSION};
+use crate::{PROTOCOL_VERSION, messages, slip};
 use serialport::{SerialPort, SerialPortInfo};
 use std::convert::TryInto;
 use std::hash::Hasher;

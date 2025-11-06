@@ -4,7 +4,7 @@ use std::{
     io::{self, Read, Write},
 };
 
-use byteorder::{ReadBytesExt, WriteBytesExt, LE};
+use byteorder::{LE, ReadBytesExt, WriteBytesExt};
 
 // opcodes
 // note: incomplete; only contains opcodes that we use or explored
@@ -469,7 +469,7 @@ pub fn parse_response<R: Request>(buf: &[u8]) -> crate::Result<R::Response> {
                 code,
                 ext_error: None,
             }
-            .into())
+            .into());
         }
     }
 
