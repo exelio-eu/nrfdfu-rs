@@ -73,13 +73,17 @@ struct Args {
     )]
     get_images: bool,
 
+    #[arg(short('p'), long, global = true, help = "Select a serial port")]
+    port: Option<String>,
+
     #[arg(
-        short('p'),
+        short('t'),
         long,
         global = true,
-        help = "Select a serial port"
+        default_value = "1",
+        help = "Amount of attempts to try the update"
     )]
-    port: Option<String>,
+    tries: usize,
 }
 
 /// Previous errors occurred and were printed.
@@ -167,12 +171,13 @@ fn run() -> Result<()> {
     let mut error_in_all = false;
 
     for port in matching_ports {
-        let result = run_on_port(
+        let result = run_on_port_attempts(
             &port,
             image_path.as_ref(),
             image.clone(),
             args.get_images,
             args.abort,
+            args.tries,
         );
         if let Err(e) = result {
             eprintln!("error processing {}: {e}", &port.port_name);
@@ -190,6 +195,38 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_on_port_attempts(
+    port: &serialport::SerialPortInfo,
+    path: Option<&std::path::PathBuf>,
+    image: Option<RadioManifestJSONObject>,
+    get_images: bool,
+    abort: bool,
+    max_attempts: usize,
+) -> Result<()> {
+    let mut last_error = None;
+    for i in 0..max_attempts {
+        println!("Attempt #{i} on port {}", port.port_name);
+        match run_on_port(port, path, image.clone(), get_images, abort) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("Attempt #{i} on port {} failed: {e}", port.port_name);
+                last_error = Some(e);
+                // sleep one second between attempts
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+    if let Some(e) = last_error {
+        Err(e)
+    } else {
+        eprintln!(
+            "No attempts were actually performed on port {}",
+            port.port_name
+        );
+        Ok(())
+    }
 }
 
 fn run_on_port(
