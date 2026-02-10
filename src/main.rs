@@ -84,6 +84,15 @@ struct Args {
         help = "Amount of attempts to try the update"
     )]
     tries: usize,
+
+    #[arg(
+        short('d'),
+        long,
+        global = true,
+        default_value = "false",
+        help = "Check if the device is in bootloader mode without performing the update"
+    )]
+    dry_run: bool,
 }
 
 /// Previous errors occurred and were printed.
@@ -170,21 +179,23 @@ fn run() -> Result<()> {
 
     let mut error_in_all = false;
 
-    for port in matching_ports {
-        let result = run_on_port_attempts(
-            &port,
-            image_path.as_ref(),
-            image.clone(),
-            args.get_images,
-            args.abort,
-            args.tries,
-        );
-        if let Err(e) = result {
-            eprintln!("error processing {}: {e}", &port.port_name);
-            if !args.all {
-                return Err(e);
-            } else {
-                error_in_all = true;
+    if !args.dry_run {
+        for port in matching_ports {
+            let result = run_on_port_attempts(
+                &port,
+                image_path.as_ref(),
+                image.clone(),
+                args.get_images,
+                args.abort,
+                args.tries,
+            );
+            if let Err(e) = result {
+                eprintln!("error processing {}: {e}", &port.port_name);
+                if !args.all {
+                    return Err(e);
+                } else {
+                    error_in_all = true;
+                }
             }
         }
     }
